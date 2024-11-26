@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "whatsapp-image-downloader"
+version = "0.1.0"
+description = ""
+authors = ["kartikay-bagla <kartikaybagla@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.115.5"
+uvicorn = "^0.32.1"
+twilio = "^9.3.7"
+python-multipart = "^0.0.17"
+sqlalchemy = "^2.0.36"
+fastapi-utils = "^0.8.0"
+typing-inspect = "^0.9.0"
+
+
+[tool.poetry.group.dev.dependencies]
+python-dotenv = "^1.0.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

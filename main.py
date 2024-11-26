@@ -1,99 +1,161 @@
-from selenium import webdriver
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.by import By
-import base64
-import time
-import requests
-from datetime import datetime
-from uuid import uuid4
+# main.py
 
-import traceback
-
-# Set the contact name and local directory for saving images
-CONTACT_NAME = "CONTACT NAME"
-SAVE_DIRECTORY = "images/"
-
-
-def get_file_content_chrome(driver, uri):
-    result = driver.execute_async_script(
-        """
-        var uri = arguments[0];
-        var callback = arguments[1];
-        var toBase64 = function(buffer){for(var r,n=new Uint8Array(buffer),t=n.length,a=new Uint8Array(4*Math.ceil(t/3)),i=new Uint8Array(64),o=0,c=0;64>c;++c)i[c]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".charCodeAt(c);for(c=0;t-t%3>c;c+=3,o+=4)r=n[c]<<16|n[c+1]<<8|n[c+2],a[o]=i[r>>18],a[o+1]=i[r>>12&63],a[o+2]=i[r>>6&63],a[o+3]=i[63&r];return t%3===1?(r=n[t-1],a[o]=i[r>>2],a[o+1]=i[r<<4&63],a[o+2]=61,a[o+3]=61):t%3===2&&(r=(n[t-2]<<8)+n[t-1],a[o]=i[r>>10],a[o+1]=i[r>>4&63],a[o+2]=i[r<<2&63],a[o+3]=61),new TextDecoder("ascii").decode(a)};
-        var xhr = new XMLHttpRequest();
-        xhr.responseType = 'arraybuffer';
-        xhr.onload = function(){ callback(toBase64(xhr.response)) };
-        xhr.onerror = function(){ callback(xhr.status) };
-        xhr.open('GET', uri);
-        xhr.send();
-        """,
-        uri,
-    )
-    if type(result) == int:
-        raise Exception(f"Request for uri {uri} failed with status {result}")
-    return base64.b64decode(result)
-
-
-# Start the web driver and navigate to WhatsApp Web
-driver = webdriver.Firefox()
-
-driver.get("https://web.whatsapp.com/")
-
-# Wait for the user to scan the QR code and log in
-input("Scan the QR code and press Enter once you're logged in...")
-
-# Find the chat for the specified contact
-search_box = driver.find_element(
-    By.XPATH, '//div[contains(@class,"copyable-text selectable-text")]'
+import datetime as dt
+from fastapi import FastAPI, Request, BackgroundTasks, Response
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    Boolean,
+    ForeignKey,
 )
-search_box.click()
-search_box.send_keys(CONTACT_NAME)
-time.sleep(2)
-chat = driver.find_element(By.XPATH, f'//span[@title="{CONTACT_NAME}"]')
-chat.click()
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+import requests
+import uuid
+from requests.auth import HTTPBasicAuth
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
+from fastapi_utils.tasks import repeat_every
+import os
+
+app = FastAPI()
+engine = create_engine("sqlite:///sessions.db")
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+ACCOUNT_ID = os.getenv("ACCOUNT_ID")
+AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+client = Client(ACCOUNT_ID, AUTH_TOKEN)
+SERVICE_NUMBER = os.getenv("SERVICE_NUMBER")
+IMAGE_OUTPUT_PATH = os.getenv("IMAGE_OUTPUT_PATH")
 
 
-downloaded_urls = set()
-while True:
-    # Scroll to the bottom of the chat to load all messages
-    message_count = len(driver.find_elements(By.XPATH, '//div[@class="message-in"]'))
-    while True:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        new_message_count = len(
-            driver.find_elements(By.XPATH, '//div[@class="message-in"]')
+class UploadSession(Base):
+    __tablename__ = "upload_sessions"
+    session_id = Column(Integer, primary_key=True, index=True)
+    customer_id = Column(String, index=True)
+    session_end_time = Column(DateTime)
+    closed = Column(Boolean, default=False)
+
+    images = relationship("Image", back_populates="upload_session")
+
+
+class Image(Base):
+    __tablename__ = "images"
+    image_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    message_id = Column(String)
+    from_mobile = Column(String)
+    twilio_account_id = Column(String)
+    image_url = Column(String)
+    attached_message = Column(String)
+    upload_session_id = Column(Integer, ForeignKey("upload_sessions.session_id"))
+
+    upload_session = relationship("UploadSession", back_populates="images")
+
+
+Base.metadata.create_all(bind=engine)
+
+
+def download_with_basic_auth(url, username=ACCOUNT_ID, password=AUTH_TOKEN):
+    response = requests.get(url, auth=HTTPBasicAuth(username, password))
+    if response.status_code == 200:
+        return response.content
+    else:
+        response.raise_for_status()
+
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    form_data = await request.form()
+
+    for k, v in form_data.items():
+        print(f"{k}: {v}")
+
+    from_mobile = form_data.get("From").split(":")[-1]
+    message_body = "_".join(form_data.get("Body").split(" "))
+    account_sid = form_data.get("AccountSid")
+    message_sid = form_data.get("MessageSid")
+    num_images = int(form_data.get("NumMedia")) or 0
+
+    resp = MessagingResponse()
+
+    if num_images == 0:
+        print("No images attached.")
+        resp.message("Incorrect input.")
+        return Response(content=str(resp), media_type="application/xml")
+
+    db = SessionLocal()
+
+    session = (
+        db.query(UploadSession).filter_by(customer_id=from_mobile, closed=False).first()
+    )
+    current_time = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+    if not session:
+        # Create new session
+        print("Creating new session.")
+        session = UploadSession(
+            customer_id=from_mobile,
+            session_end_time=current_time + dt.timedelta(seconds=30),
         )
-        if new_message_count == message_count:
-            break
-        message_count = new_message_count
+        db.add(session)
+        db.commit()
+        # Send reply
+        resp.message("Beginning Upload Session.")
+    else:
+        # Update session
+        print("Updating existing session.")
+        session.session_end_time = max(
+            session.session_end_time, current_time + dt.timedelta(seconds=30)
+        )
 
-    # Find all images sent by the contact and download them to a local directory
-    images = driver.find_elements(By.XPATH, '//div[@data-testid="image-thumb"]//img')
-    for image in images:
-        image_src = image.get_attribute("src")
-        if image_src is None:
-            continue
-        if image_src in downloaded_urls:
-            continue
+    print(f"Parsing {num_images} images of session {session.session_id}.")
+    for i in range(num_images):
+        image = Image(
+            message_id=message_sid,
+            from_mobile=from_mobile,
+            twilio_account_id=account_sid,
+            image_url=form_data.get(f"MediaUrl{i}"),
+            attached_message=message_body,
+            upload_session_id=session.session_id,
+        )
+        db.add(image)
+        db.commit()
+        img_data = download_with_basic_auth(form_data.get(f"MediaUrl{i}"))
+        with open(os.path.join(IMAGE_OUTPUT_PATH, f"{image.image_id}.jpg"), "wb") as f:
+            f.write(img_data)
+    db.commit()
+    db.close()
+    print()
+    return Response(content=str(resp), media_type="application/xml")
 
-        downloaded_urls.add(image_src)
 
-        counter = 0
-        while counter < 5:
-            try:
-                # Execute JavaScript to extract binary data from blob URL
-                image_data = get_file_content_chrome(driver, uri=image_src)
-
-                with open(f"{SAVE_DIRECTORY}{datetime.now()} - {uuid4()}.jpg", "wb") as file:
-                    file.write(image_data)
-                    break
-            except Exception:
-                print(f"Try number {counter}")
-                traceback.print_exc()
-            finally:
-                counter += 1
-        if counter >= 5:
-            print("I give up on on this one. For now.")
-            downloaded_urls.remove(image_src)
-    # Wait for a few seconds before checking for new images
-    time.sleep(10)
+@app.on_event("startup")
+@repeat_every(seconds=20)
+def check_sessions():
+    print("Checking for closed sessions.")
+    db = SessionLocal()
+    sessions = (
+        db.query(UploadSession)
+        .filter(
+            UploadSession.session_end_time <= dt.datetime.now(dt.timezone.utc),
+            UploadSession.closed == False,  # noqa:E712
+        )
+        .all()
+    )
+    for session in sessions:
+        print(f"Closing session {session.session_id}.")
+        # Get number of images
+        img_count = len(session.images)
+        # Mark session as closed
+        session.closed = True
+        db.commit()
+        # Send message with the number of images received
+        client.messages.create(
+            to="whatsapp:" + session.customer_id,
+            from_="whatsapp:" + SERVICE_NUMBER,
+            body=f"Received and uploaded {img_count} images."
+        )
+    db.close()
