@@ -39,16 +39,17 @@ class UploadSession(Base):
     session_end_time = Column(DateTime)
     closed = Column(Boolean, default=False)
 
-    images = relationship("Image", back_populates="upload_session")
+    images = relationship("Media", back_populates="upload_session")
 
 
-class Image(Base):
-    __tablename__ = "images"
-    image_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+class Media(Base):
+    __tablename__ = "media"
+    media_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     message_id = Column(String)
     from_mobile = Column(String)
     twilio_account_id = Column(String)
-    image_url = Column(String)
+    media_url = Column(String)
+    media_content_type = Column(String)
     attached_message = Column(String)
     upload_session_id = Column(Integer, ForeignKey("upload_sessions.session_id"))
 
@@ -77,11 +78,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     message_body = "_".join(form_data.get("Body").split(" "))
     account_sid = form_data.get("AccountSid")
     message_sid = form_data.get("MessageSid")
-    num_images = int(form_data.get("NumMedia")) or 0
+    num_media = int(form_data.get("NumMedia")) or 0
 
     resp = MessagingResponse()
 
-    if num_images == 0:
+    if num_media == 0:
         print("No images attached.")
         resp.message("Incorrect input.")
         return Response(content=str(resp), media_type="application/xml")
@@ -111,21 +112,24 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             session.session_end_time, current_time + dt.timedelta(seconds=30)
         )
 
-    print(f"Parsing {num_images} images of session {session.session_id}.")
-    for i in range(num_images):
-        image = Image(
+    print(f"Parsing {num_media} media of session {session.session_id}.")
+    for i in range(num_media):
+        media_content_type = form_data.get(f"MediaContentType{i}")
+        file_type = media_content_type.split("/")[-1]
+        media = Media(
             message_id=message_sid,
             from_mobile=from_mobile,
             twilio_account_id=account_sid,
-            image_url=form_data.get(f"MediaUrl{i}"),
+            media_url=form_data.get(f"MediaUrl{i}"),
+            media_content_type=media_content_type,
             attached_message=message_body,
             upload_session_id=session.session_id,
         )
-        db.add(image)
+        db.add(media)
         db.commit()
-        img_data = download_with_basic_auth(form_data.get(f"MediaUrl{i}"))
-        with open(os.path.join(IMAGE_OUTPUT_PATH, f"{image.image_id}.jpg"), "wb") as f:
-            f.write(img_data)
+        media_data = download_with_basic_auth(form_data.get(f"MediaUrl{i}"))
+        with open(os.path.join(IMAGE_OUTPUT_PATH, f"{media.media_id}.{file_type}"), "wb") as f:
+            f.write(media_data)
     db.commit()
     db.close()
     print()
@@ -156,6 +160,6 @@ def check_sessions():
         client.messages.create(
             to="whatsapp:" + session.customer_id,
             from_="whatsapp:" + SERVICE_NUMBER,
-            body=f"Received and uploaded {img_count} images."
+            body=f"Received and uploaded {img_count} media."
         )
     db.close()
